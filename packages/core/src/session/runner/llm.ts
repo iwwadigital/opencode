@@ -200,6 +200,11 @@ export const layer = Layer.effect(
       const request = LLM.request({
         model,
         providerOptions: { openai: { promptCacheKey } },
+        // IWWA: injeta sessão/usuário como headers HTTP p/ o proxy de logging correlacionar
+        // os turnos (session.id tem o formato ses_<hash>). Único ponto onde session.id está
+        // em escopo; http.headers é o mecanismo nativo de header por request. Diff mínimo
+        // de propósito, p/ o rebase com o upstream ficar barato.
+        http: { headers: { "X-IWWA-Session": session.id, "X-IWWA-User": process.env.IWWA_USER_ID ?? "desconhecido" } },
         system: [agent.info?.system, system.baseline]
           .filter((part): part is string => part !== undefined && part.length > 0)
           .map(SystemPart.make),
