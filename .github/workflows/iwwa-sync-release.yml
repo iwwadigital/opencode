@@ -1,0 +1,163 @@
+# IWWA — sincroniza a branch `iwwa` com a última RELEASE estável do upstream sst/opencode,
+# rebaseando as modificações da IWWA por cima, buildando o binário `iwwacode` (Linux glibc x64)
+# e publicando-o como asset de uma release do fork.
+#
+# Por que polling (cron) e não o evento `release`? O `release` só dispara para releases do
+# PRÓPRIO repo; não dá pra ouvir a release de sst/opencode. Então checamos 1x/dia.
+#
+# Este workflow VIVE na branch default `dev` (de onde o agendamento dispara) mas OPERA sobre a
+# `iwwa` — assim ele não entra no patch da IWWA (mantém o diff em 3 arquivos = rebase barato).
+name: IWWA sync release
+
+on:
+  schedule:
+    - cron: "23 6 * * *" # diário ~06:23 UTC
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag do upstream (vazio = última release). Ex.: v1.17.11"
+        required: false
+        default: ""
+      force:
+        description: "Rebuildar mesmo se a release do fork já existir"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # push --force-with-lease na iwwa + criar release/tag no fork
+  issues: write # abrir issue se o rebase conflitar
+
+concurrency:
+  group: iwwa-sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: sst/opencode
+  IWWA_BRANCH: iwwa
+  IWWA_MARKER: X-IWWA-Session # marcador que prova que o patch IWWA sobreviveu ao rebase
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descobrir a release alvo do upstream
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.ref }}" ]; then
+            TAG="${{ inputs.ref }}"
+          else
+            TAG="$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)"
+          fi
+          [ -n "$TAG" ] || { echo "::error::não consegui resolver a tag de release do upstream"; exit 1; }
+          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
+          echo "rel=iwwacode-$TAG"   >> "$GITHUB_OUTPUT"
+          echo ">> release alvo: $TAG"
+
+      - name: Já temos essa release no fork?
+        id: have
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; echo ">> force=true, vai rebuildar"; exit 0
+          fi
+          if gh release view "${{ steps.target.outputs.rel }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true"  >> "$GITHUB_OUTPUT"; echo ">> ${{ steps.target.outputs.rel }} já existe — nada a fazer"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"; echo ">> release nova, seguindo"
+          fi
+
+      - name: Checkout da branch iwwa
+        if: steps.have.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.IWWA_BRANCH }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Rebase da iwwa sobre a tag de release
+        if: steps.have.outputs.skip == 'false'
+        id: rebase
+        run: |
+          set -euo pipefail
+          git config user.name  "iwwa-bot"
+          git config user.email "iwwa-bot@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
+          git fetch --no-tags upstream "refs/tags/${{ steps.target.outputs.tag }}:refs/tags/${{ steps.target.outputs.tag }}"
+          if git rebase "${{ steps.target.outputs.tag }}"; then
+            grep -q "$IWWA_MARKER" packages/core/src/session/runner/llm.ts \
+              || { echo "::error::marcador $IWWA_MARKER sumiu após o rebase"; exit 1; }
+            echo ">> rebase ok, patch IWWA preservado"
+          else
+            git rebase --abort || true
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::rebase conflitou — upstream mexeu nas mesmas linhas do patch IWWA"
+            exit 1
+          fi
+
+      - name: Abrir issue se o rebase conflitar
+        if: failure() && steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TITLE="Rebase automático falhou: iwwa sobre ${{ steps.target.outputs.tag }}"
+          EXISTING="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title $TITLE" --json number -q '.[0].number' || true)"
+          if [ -z "$EXISTING" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body \
+              "O rebase automático da branch \`iwwa\` sobre a release \`${{ steps.target.outputs.tag }}\` do upstream entrou em **conflito** (o upstream mexeu nas mesmas linhas do patch IWWA).
+
+          **Resolva manualmente** num clone de trabalho do fork:
+          \`\`\`
+          git fetch upstream tag ${{ steps.target.outputs.tag }}
+          git checkout iwwa && git rebase ${{ steps.target.outputs.tag }}
+          # resolva os conflitos mantendo a injeção X-IWWA-Session/X-IWWA-User e o branding IWWA CODE
+          git push --force-with-lease origin iwwa
+          \`\`\`
+          Depois é só rodar o workflow de novo (ele rebuilda e publica a release)."
+          else
+            echo ">> issue #$EXISTING já aberta para essa tag"
+          fi
+
+      - name: Push da iwwa rebaseada
+        if: steps.have.outputs.skip == 'false'
+        run: git push --force-with-lease origin "HEAD:${IWWA_BRANCH}"
+
+      - name: Setup bun
+        if: steps.have.outputs.skip == 'false'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build do binário iwwacode
+        if: steps.have.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          bun install
+          ( cd packages/opencode && bun run build --single )
+          BIN="$(ls packages/opencode/dist/opencode-linux-*/bin/opencode 2>/dev/null | grep -v musl | head -1 || true)"
+          [ -n "$BIN" ] || { echo "::error::binário não encontrado em packages/opencode/dist/"; exit 1; }
+          install -m 755 "$BIN" ./iwwacode
+          ./iwwacode --version || true
+          shasum -a 256 ./iwwacode | tee iwwacode.sha256
+
+      - name: Publicar release com o binário
+        if: steps.have.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="$(cut -d' ' -f1 iwwacode.sha256)"
+          gh release create "${{ steps.target.outputs.rel }}" iwwacode iwwacode.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$IWWA_BRANCH" \
+            --title "iwwacode ${{ steps.target.outputs.tag }}" \
+            --notes "Binário \`iwwacode\` (Linux glibc x64) buildado da branch \`iwwa\` rebaseada sobre o upstream \`${UPSTREAM}@${{ steps.target.outputs.tag }}\`.
+
+          \`\`\`
+          sha256  $SHA
+          \`\`\`
+          Consumido pelo Dockerfile via \`deploy/fetch-iwwacode.sh\`."
