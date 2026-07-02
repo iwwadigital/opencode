@@ -34,7 +34,7 @@ concurrency:
 env:
   UPSTREAM: sst/opencode
   IWWA_BRANCH: iwwa
-  IWWA_MARKER: X-IWWA-Session # marcador que prova que o patch IWWA sobreviveu ao rebase
+  IWWA_MARKER: iwwacode # marcador que prova que o patch IWWA (branding) sobreviveu ao rebase
 
 jobs:
   sync:
@@ -89,7 +89,7 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
           git fetch --no-tags upstream "refs/tags/${{ steps.target.outputs.tag }}:refs/tags/${{ steps.target.outputs.tag }}"
           if git rebase "${{ steps.target.outputs.tag }}"; then
-            grep -q "$IWWA_MARKER" packages/core/src/session/runner/llm.ts \
+            grep -q "$IWWA_MARKER" packages/tui/src/attention.ts \
               || { echo "::error::marcador $IWWA_MARKER sumiu após o rebase"; exit 1; }
             echo ">> rebase ok, patch IWWA preservado"
           else
